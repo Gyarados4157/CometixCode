@@ -31,6 +31,41 @@ pub struct StatusLineCommandInput {
     pub remote: Option<StatusLineRemote>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<StatusLineWorktree>,
+    // Fields newer CC builds send (observed on CC 2.1.316) that status line
+    // tools such as ccline read. Optional so older consumers are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<StatusLineEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StatusLineThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<StatusLinePromptCache>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusLineEffort {
+    pub level: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusLineThinking {
+    pub enabled: bool,
+}
+
+/// Prompt-cache health for the main conversation thread, in the shape CC
+/// 2.1.316 emits. Cometix fills the subset it can observe from API usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusLinePromptCache {
+    pub warm: bool,
+    pub caching_observed: bool,
+    pub ttl: String,
+    pub expires_at: Option<i64>,
+    pub requests: u64,
+    pub misses: u64,
+    pub hit_ratio: Option<f64>,
+    pub cache_write_tokens: u64,
+    pub last_miss_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

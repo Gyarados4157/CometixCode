@@ -22,6 +22,21 @@ struct CostState {
     model_usage: HashMap<String, crate::utils::config::ModelUsageStats>,
     restored_duration_ms: u64,
     session_started_at: Option<Instant>,
+    prompt_cache: PromptCacheStats,
+}
+
+/// Main-thread prompt cache observations (fork addition; feeds the status
+/// line `prompt_cache` block).
+#[derive(Debug, Default, Clone)]
+struct PromptCacheStats {
+    requests: u64,
+    misses: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    uncached_input_tokens: u64,
+    last_request_at: Option<i64>,
+    last_miss_at: Option<i64>,
+    ttl_secs: i64,
 }
 
 static COST_STATE: LazyLock<Mutex<CostState>> = LazyLock::new(|| Mutex::new(CostState::default()));
@@ -99,6 +114,80 @@ pub fn add_to_total_cost(cost_usd: f64, api_duration_ms: u64) {
         state.total_cost_usd += cost_usd;
         state.total_api_duration_ms = state.total_api_duration_ms.saturating_add(api_duration_ms);
     });
+}
+
+/// Record one completed API response (fork addition).
+///
+/// Maps to: CC `addToTotalSessionCost(cost, usage, model)` +
+/// `addToTotalDurationState` as called from `services/api/claude.ts` after
+/// each response. `main_thread_cache_ttl` is `Some(ttl_secs)` only for the
+/// main conversation thread, whose requests feed prompt cache stats.
+pub fn record_api_response(
+    model: &str,
+    usage: &crate::types::message::TokenUsage,
+    api_duration_ms: u64,
+    main_thread_cache_ttl: Option<i64>,
+) {
+    let cost = crate::utils::model_cost::calculate_usd_cost(model, usage);
+    add_to_total_cost(cost, api_duration_ms);
+    with_state(|state| {
+        state.total_api_duration_without_retries_ms = state
+            .total_api_duration_without_retries_ms
+            .saturating_add(api_duration_ms);
+        let entry = state.model_usage.entry(model.to_string()).or_default();
+        entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+        entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+        entry.cache_read_input_tokens = entry
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        entry.cache_creation_input_tokens = entry
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        entry.cost_usd += cost;
+
+        if let Some(ttl_secs) = main_thread_cache_ttl {
+            let now = chrono::Utc::now().timestamp();
+            let cache = &mut state.prompt_cache;
+            // A miss: a follow-up request that read nothing from cache while
+            // the previous write should still have been live.
+            let expected_warm = cache
+                .last_request_at
+                .is_some_and(|last| now - last < cache.ttl_secs.max(ttl_secs));
+            if expected_warm && usage.cache_read_input_tokens == 0 {
+                cache.misses += 1;
+                cache.last_miss_at = Some(now);
+            }
+            cache.requests += 1;
+            cache.cache_read_tokens += usage.cache_read_input_tokens;
+            cache.cache_write_tokens += usage.cache_creation_input_tokens;
+            cache.uncached_input_tokens += usage.input_tokens;
+            cache.last_request_at = Some(now);
+            cache.ttl_secs = ttl_secs;
+        }
+    });
+}
+
+/// Status line `prompt_cache` block, or `None` before the first main-thread
+/// response (fork addition).
+pub fn get_prompt_cache_status() -> Option<crate::types::status_line::StatusLinePromptCache> {
+    with_state(|state| {
+        let cache = &state.prompt_cache;
+        let last = cache.last_request_at?;
+        let expires_at = last + cache.ttl_secs;
+        let total_in =
+            cache.cache_read_tokens + cache.cache_write_tokens + cache.uncached_input_tokens;
+        Some(crate::types::status_line::StatusLinePromptCache {
+            warm: chrono::Utc::now().timestamp() < expires_at,
+            caching_observed: cache.cache_read_tokens + cache.cache_write_tokens > 0,
+            ttl: if cache.ttl_secs >= 3600 { "1h" } else { "5m" }.to_string(),
+            expires_at: Some(expires_at),
+            requests: cache.requests,
+            misses: cache.misses,
+            hit_ratio: (total_in > 0).then(|| cache.cache_read_tokens as f64 / total_in as f64),
+            cache_write_tokens: cache.cache_write_tokens,
+            last_miss_at: cache.last_miss_at,
+        })
+    })
 }
 
 /// Maps to: CC `addToTotalLinesChanged`.

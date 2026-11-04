@@ -133,6 +133,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "echo status".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..SettingsJson::default()
         };

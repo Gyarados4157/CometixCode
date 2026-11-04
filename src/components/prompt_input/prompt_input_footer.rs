@@ -691,6 +691,7 @@ mod tests {
                     kind: Some("command".to_string()),
                     command: "printf ok".to_string(),
                     padding: Some(1),
+                    refresh_interval: None,
                 }),
                 ..Default::default()
             });
@@ -731,6 +732,7 @@ mod tests {
                     kind: Some("command".to_string()),
                     command: "printf ok".to_string(),
                     padding: None,
+                    refresh_interval: None,
                 }),
                 ..Default::default()
             });

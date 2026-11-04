@@ -4088,6 +4088,27 @@ async fn drain_sdk_message_stream_to_channel(
     let assistant_stop_reason = stop_reason;
     let assistant_model = response_model.or_else(|| Some(options.model.clone()));
     let duration_ms = stream_started_at.elapsed().as_millis() as u64;
+    // Fork addition — maps to CC `addToTotalSessionCost` after each response:
+    // feeds status line cost / API duration / prompt cache stats.
+    if let Some(final_usage) = usage.as_ref() {
+        let is_main_thread =
+            options.agent_id.is_none() && options.query_source.starts_with("repl_main_thread");
+        let main_thread_cache_ttl = is_main_thread.then(|| {
+            match get_cache_control(None, Some(options.query_source.as_str()))
+                .ttl
+                .as_deref()
+            {
+                Some("1h") => 3600,
+                _ => 300,
+            }
+        });
+        crate::cost_tracker::record_api_response(
+            assistant_model.as_deref().unwrap_or(&options.model),
+            final_usage,
+            duration_ms,
+            main_thread_cache_ttl,
+        );
+    }
     super::api_trace::emit_current(
         "stream_meta",
         serde_json::json!({

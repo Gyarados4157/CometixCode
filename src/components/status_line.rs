@@ -13,8 +13,8 @@
 
 use crate::constants::output_styles::DEFAULT_OUTPUT_STYLE_NAME;
 use crate::cost_tracker::{
-    get_total_api_duration, get_total_cost, get_total_duration, get_total_input_tokens,
-    get_total_lines_added, get_total_lines_removed, get_total_output_tokens,
+    get_total_api_duration, get_total_cost, get_total_duration, get_total_lines_added,
+    get_total_lines_removed,
 };
 use crate::types::message::Message;
 use crate::types::permissions::PermissionMode;
@@ -55,6 +55,21 @@ pub fn status_line_should_display(settings: &SettingsJson) -> bool {
 /// yet.
 pub fn status_line_should_render(configured: bool, exit_hint_visible: bool) -> bool {
     !exit_hint_visible && configured
+}
+
+/// Cap on rows a status line command may occupy.
+pub const STATUS_LINE_MAX_ROWS: usize = 8;
+
+/// Rows the status line occupies: one per non-empty output line, at least one
+/// (the reserved loading row), capped at [`STATUS_LINE_MAX_ROWS`].
+///
+/// Deviation from CC: CC's Ink `<Text>` grows to fit multi-line command
+/// output. Cometix's footer is a computed height budget, so the row count is
+/// derived explicitly and shared by the component and `PromptInput`.
+pub fn status_line_row_count(text: Option<&str>) -> usize {
+    text.map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+        .clamp(1, STATUS_LINE_MAX_ROWS)
 }
 
 /// Maps to: CC `components/StatusLine.tsx#getLastAssistantMessageId`.
@@ -161,9 +176,18 @@ pub fn build_status_line_command_input(
             total_lines_added: get_total_lines_added(),
             total_lines_removed: get_total_lines_removed(),
         },
+        // CC 2.1.316 reports the latest response's context size here (input +
+        // cache creation + cache read), not a session-cumulative sum; status
+        // line tools (ccline) derive context usage from it.
         context_window: StatusLineContextWindow {
-            total_input_tokens: get_total_input_tokens(),
-            total_output_tokens: get_total_output_tokens(),
+            total_input_tokens: current_usage.as_ref().map_or(0, |usage| {
+                usage.input_tokens
+                    + usage.cache_creation_input_tokens
+                    + usage.cache_read_input_tokens
+            }),
+            total_output_tokens: current_usage
+                .as_ref()
+                .map_or(0, |usage| usage.output_tokens),
             context_window_size,
             current_usage,
             used_percentage,
@@ -175,6 +199,10 @@ pub fn build_status_line_command_input(
         agent: None,
         remote: None,
         worktree: None,
+        effort: None,
+        thinking: None,
+        fast_mode: None,
+        prompt_cache: crate::cost_tracker::get_prompt_cache_status(),
     };
 
     // Optional blocks — same gates as CC StatusLine.tsx.
@@ -243,6 +271,45 @@ pub fn build_status_line_command_input_with_permission_mode(
 }
 
 /// Maps to: CC `StatusLineInner#doUpdate` body (without React debounce/refs).
+/// Live AppState values newer CC builds put on the status line input
+/// (`effort`, `thinking`, `fast_mode`). Fork addition.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatusLineRuntimeExtras {
+    pub effort_level: Option<String>,
+    pub thinking_enabled: Option<bool>,
+    pub fast_mode: Option<bool>,
+}
+
+impl StatusLineRuntimeExtras {
+    pub fn from_app_state(
+        state: &crate::state::app_state_store::AppState,
+        main_loop_model: &str,
+    ) -> Self {
+        Self {
+            effort_level: crate::utils::effort::resolve_applied_effort(
+                main_loop_model,
+                state.effort_value.as_ref(),
+            )
+            .map(|effort| effort.as_str()),
+            thinking_enabled: Some(state.thinking_enabled.unwrap_or_else(|| {
+                crate::utils::thinking::should_enable_thinking_by_default(&state.settings)
+            })),
+            fast_mode: Some(state.fast_mode),
+        }
+    }
+
+    fn apply(&self, input: &mut StatusLineCommandInput) {
+        input.effort = self
+            .effort_level
+            .clone()
+            .map(|level| crate::types::status_line::StatusLineEffort { level });
+        input.thinking = self
+            .thinking_enabled
+            .map(|enabled| crate::types::status_line::StatusLineThinking { enabled });
+        input.fast_mode = self.fast_mode;
+    }
+}
+
 pub async fn run_status_line_update(
     permission_mode: PermissionMode,
     settings: &SettingsJson,
@@ -253,9 +320,10 @@ pub async fn run_status_line_update(
     workspace_trusted: bool,
     policy_settings: Option<&SettingsJson>,
     log_result: bool,
+    extras: &StatusLineRuntimeExtras,
 ) -> Option<String> {
     let exceeds_200k_tokens = does_most_recent_assistant_message_exceed_200k(messages);
-    let status_input = build_status_line_command_input(
+    let mut status_input = build_status_line_command_input(
         permission_mode,
         exceeds_200k_tokens,
         settings,
@@ -264,6 +332,7 @@ pub async fn run_status_line_update(
         main_loop_model,
         vim_mode,
     );
+    extras.apply(&mut status_input);
     crate::services::hooks::statusline::execute_status_line_command(
         &status_input,
         workspace_trusted,
@@ -394,6 +463,10 @@ fn use_status_line_update(hooks: &mut Hooks, inputs: StatusLineUpdateInputs) {
         // CC's `previousStateRef` (`:307-318`), owned by the loop rather than
         // by a render, since this future outlives every individual render.
         let mut previous = StatusLineTriggerState::default();
+        // Fork addition: AppState extras and `statusLine.refreshInterval`
+        // also trigger a re-run.
+        let mut previous_extras: Option<StatusLineRuntimeExtras> = None;
+        let mut last_run: Option<std::time::Instant> = None;
         loop {
             // Deadline poll standing in for CC's resettable `setTimeout`
             // (`:291-304`) — the established L1 for this shape (PORTING.md).
@@ -406,10 +479,26 @@ fn use_status_line_update(hooks: &mut Hooks, inputs: StatusLineUpdateInputs) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let snapshot = store.get();
+            let extras = StatusLineRuntimeExtras::from_app_state(
+                &snapshot,
+                current.main_loop_model.as_deref().unwrap_or_default(),
+            );
+            let refresh_due = snapshot
+                .settings
+                .status_line
+                .as_ref()
+                .and_then(|status_line| status_line.refresh_interval)
+                .filter(|secs| *secs > 0)
+                .is_some_and(|secs| {
+                    last_run.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(secs))
+                });
             // CC `:307-312` — all four equal means do nothing.
-            if current == previous {
+            if current == previous && previous_extras.as_ref() == Some(&extras) && !refresh_due {
                 continue;
             }
+            previous_extras = Some(extras.clone());
+            last_run = Some(std::time::Instant::now());
             // CC `:313-317` advances permissionMode / vimMode / mainLoopModel
             // but DELIBERATELY not messageId, so the next `doUpdate` recomputes
             // `exceeds200kTokens` against the latest messages.
@@ -418,7 +507,6 @@ fn use_status_line_update(hooks: &mut Hooks, inputs: StatusLineUpdateInputs) {
                 ..current.clone()
             };
 
-            let snapshot = store.get();
             let settings = (*snapshot.settings).clone();
             let added_dirs: Vec<String> = snapshot
                 .tool_permission_context
@@ -447,6 +535,7 @@ fn use_status_line_update(hooks: &mut Hooks, inputs: StatusLineUpdateInputs) {
                 crate::utils::config::check_has_trust_dialog_accepted(),
                 None,
                 true,
+                &extras,
             )
             .await;
 
@@ -516,12 +605,13 @@ pub fn StatusLine(props: &StatusLineProps, mut hooks: Hooks) -> impl Into<AnyEle
     // unconditional here, and `footer_height_for` counts the row on the same
     // condition that mounts it.
     let text = props.text.as_deref().unwrap_or(" ");
+    let rows = status_line_row_count(props.text.as_deref());
 
     element! {
         View(
-            flex_direction: FlexDirection::Row,
+            flex_direction: FlexDirection::Column,
             width: 100pct,
-            height: 1u32,
+            height: rows as u32,
             padding_x: padding_x as u32,
             overflow: Overflow::Hidden,
         ) {
@@ -548,6 +638,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "printf ok".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..Default::default()
         }));
@@ -588,6 +679,7 @@ mod tests {
                     kind: Some("command".to_string()),
                     command: "printf ok".to_string(),
                     padding: None,
+                    refresh_interval: None,
                 }),
                 ..Default::default()
             });
@@ -676,6 +768,7 @@ mod tests {
                     kind: Some("command".to_string()),
                     command: "printf ok".to_string(),
                     padding: Some(1),
+                    refresh_interval: None,
                 }),
                 ..Default::default()
             });
@@ -699,5 +792,17 @@ mod tests {
         assert_eq!(plain_style.color, Some(theme.inactive));
         let green_style = canvas.resolved_text_style(7, 0).expect("green style");
         assert_eq!(green_style.color, Some(Color::DarkGreen));
+    }
+
+    #[test]
+    fn status_line_row_count_tracks_non_empty_lines_with_floor_and_cap() {
+        assert_eq!(status_line_row_count(None), 1);
+        assert_eq!(status_line_row_count(Some("")), 1);
+        assert_eq!(status_line_row_count(Some("a")), 1);
+        assert_eq!(status_line_row_count(Some("a\nb\n\nc")), 3);
+        assert_eq!(
+            status_line_row_count(Some(&"x\n".repeat(20))),
+            STATUS_LINE_MAX_ROWS
+        );
     }
 }

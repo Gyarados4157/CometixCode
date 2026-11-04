@@ -141,6 +141,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "printf status".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..Default::default()
         };
@@ -163,6 +164,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "printf status".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..Default::default()
         };
@@ -184,6 +186,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "printf managed".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..Default::default()
         };
@@ -193,6 +196,7 @@ mod tests {
                 kind: Some("command".to_string()),
                 command: "printf user".to_string(),
                 padding: None,
+                refresh_interval: None,
             }),
             ..Default::default()
         };

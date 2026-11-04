@@ -234,6 +234,10 @@ pub struct StatusLineSettings {
     pub kind: Option<String>,
     pub command: String,
     pub padding: Option<u16>,
+    /// Re-run the command every N seconds even without a trigger change
+    /// (CC `statusLine.refreshInterval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_interval: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

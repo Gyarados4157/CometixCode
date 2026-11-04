@@ -1,13 +1,9 @@
 //! Per-model pricing tables and display formatting.
 //! Maps to CC `utils/modelCost.ts`.
 //!
-//! TODO(parity): the token-accounting half of the source (`tokensToUSDCost`
-//! `:131-142`, `getModelCosts` `:144-164`, `calculateUSDCost` `:177-180`,
-//! `calculateCostFromTokens` `:186-202`) is unported. `getModelCosts`'
-//! unknown-model path calls `bootstrap/state.ts#setHasUnknownModelCost`
-//! (`:172`), which has no Rust counterpart, and `src/cost_tracker.rs` only
-//! accumulates USD computed elsewhere — so nothing here would consume it yet.
-//! The pricing tables and formatters below are complete.
+//! `getModelCosts` / `tokensToUSDCost` / `calculateUSDCost` are ported (fork
+//! addition) and feed `cost_tracker::record_api_response`. Still unported:
+//! `calculateCostFromTokens` and the `setHasUnknownModelCost` side effect.
 
 use crate::utils::model::configs::{
     CLAUDE_3_5_HAIKU_CONFIG, CLAUDE_3_5_V2_SONNET_CONFIG, CLAUDE_3_7_SONNET_CONFIG,
@@ -145,6 +141,38 @@ fn lookup_model_costs(short_name: &str) -> Option<ModelCosts> {
         .find_map(|(key, costs)| (key == short_name).then_some(costs))
 }
 
+/// Maps to: CC `utils/modelCost.ts` `DEFAULT_UNKNOWN_MODEL_COST` — models
+/// missing from the table (newer families, gateway aliases) price at this tier.
+pub const DEFAULT_UNKNOWN_MODEL_COST: ModelCosts = COST_TIER_5_25;
+
+/// Maps to: CC `utils/modelCost.ts:144-164` `getModelCosts` (without the
+/// `setHasUnknownModelCost` side effect, which has no Rust counterpart).
+pub fn get_model_costs(model: &str, fast_mode: bool) -> ModelCosts {
+    let short_name = crate::utils::model::model::get_canonical_name(model);
+    if short_name
+        == crate::utils::model::model::first_party_name_to_canonical(
+            CLAUDE_OPUS_4_6_CONFIG.first_party,
+        )
+    {
+        return get_opus_46_cost_tier(fast_mode);
+    }
+    lookup_model_costs(&short_name).unwrap_or(DEFAULT_UNKNOWN_MODEL_COST)
+}
+
+/// Maps to: CC `utils/modelCost.ts:131-142` `tokensToUSDCost` (web search
+/// requests are not tracked on `TokenUsage`, so they are not billed here).
+pub fn tokens_to_usd_cost(costs: ModelCosts, usage: &crate::types::message::TokenUsage) -> f64 {
+    (usage.input_tokens as f64 / 1_000_000.0) * costs.input_tokens
+        + (usage.output_tokens as f64 / 1_000_000.0) * costs.output_tokens
+        + (usage.cache_read_input_tokens as f64 / 1_000_000.0) * costs.prompt_cache_read_tokens
+        + (usage.cache_creation_input_tokens as f64 / 1_000_000.0) * costs.prompt_cache_write_tokens
+}
+
+/// Maps to: CC `utils/modelCost.ts:177-180` `calculateUSDCost`.
+pub fn calculate_usd_cost(model: &str, usage: &crate::types::message::TokenUsage) -> f64 {
+    tokens_to_usd_cost(get_model_costs(model, false), usage)
+}
+
 /// Maps to: CC `utils/modelCost.ts:204-211` `formatPrice` — integers without
 /// decimals, everything else to two places.
 fn format_price(price: f64) -> String {
@@ -215,5 +243,23 @@ mod tests {
             Some("$1/$5 per Mtok")
         );
         assert_eq!(get_model_pricing_string("gpt-4").as_deref(), None);
+    }
+
+    #[test]
+    fn calculate_usd_cost_bills_all_token_kinds_and_defaults_unknown_models() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let usage = crate::types::message::TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+            cache_read_input_tokens: 1_000_000,
+            cache_deleted_input_tokens: 0,
+        };
+        // $3 + $15 + $3.75 + $0.30
+        let sonnet = calculate_usd_cost("claude-sonnet-4-5-20250929", &usage);
+        assert!((sonnet - 22.05).abs() < 1e-9, "{sonnet}");
+        // Unknown model -> DEFAULT_UNKNOWN_MODEL_COST ($5/$25 tier).
+        let unknown = calculate_usd_cost("some-future-model", &usage);
+        assert!((unknown - 36.75).abs() < 1e-9, "{unknown}");
     }
 }

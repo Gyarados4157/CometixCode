@@ -3150,7 +3150,17 @@ pub fn PromptInput<'a>(
                     .map(|data| data.teammates.len())
                     .unwrap_or(0),
             ),
-        )
+        ) + if crate::components::status_line::status_line_should_render(
+            status_line_configured,
+            exit_hint.is_some(),
+        ) {
+            // `footer_height_for` budgets one status line row; add the rest
+            // for multi-line status line output.
+            crate::components::status_line::status_line_row_count(status_line_text.as_deref())
+                - 1
+        } else {
+            0
+        }
     };
     // Match CC PromptInput's natural-height behavior. In iocraft inline
     // main-screen, leaving this root unconstrained lets terminal-size syncs
